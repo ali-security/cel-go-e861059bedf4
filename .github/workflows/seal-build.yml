@@ -1,0 +1,114 @@
+# Authored by agentic-sealer: upstream cel-go has no GitHub Actions CI (it builds
+# and tests on Google Cloud Build via cloudbuild.yaml / bazel). This workflow
+# produces the Go module zip and runs the project's go test suite.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Go test names to run (empty = full suite)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.0"
+          cache: false
+      - name: Build module zip
+        env:
+          GOTOOLCHAIN: local
+          GOFLAGS: ""
+        run: |
+          set -euo pipefail
+          HELPER="$RUNNER_TEMP/helper"
+          SRC="$RUNNER_TEMP/modsrc"
+          mkdir -p "$HELPER" "$SRC" dist
+          cd "$HELPER"
+          go mod init sealhelper
+          go get golang.org/x/mod@v0.20.0
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              out, err := os.Create(os.Args[3])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer out.Close()
+              mv := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              if err := zip.CreateFromDir(out, mv, os.Args[4]); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          go build -o "$HELPER/mkzip" .
+          cd "$GITHUB_WORKSPACE"
+          tar --exclude=./.git --exclude=./dist -cf - . | tar -xf - -C "$SRC"
+          rm -f "$SRC/.github/workflows/seal-build.yml"
+          if [ -z "$(ls -A "$SRC/.github/workflows")" ]; then rmdir "$SRC/.github/workflows"; fi
+          "$HELPER/mkzip" github.com/google/cel-go v0.26.1 "$GITHUB_WORKSPACE/dist/v0.26.1.zip" "$SRC"
+          unzip -l dist/v0.26.1.zip | tail -n 3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: dist/v0.26.1.zip
+          if-no-files-found: error
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.22.0 = upstream's own toolchain (go.mod `go 1.22.0`, MODULE.bazel
+        # go_sdk 1.22.0, cloudbuild golang:1.22.0); 1.23.0 = go.mod
+        # `toolchain go1.23.0`, the release-era toolchain.
+        go: ["1.22.0", "1.23.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: Go test
+        env:
+          GOTOOLCHAIN: local
+          GOFLAGS: -mod=vendor
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -euo pipefail
+          go version
+          if [ -n "$TEST_FILTER" ]; then
+            RUN_RE="^($(echo "$TEST_FILTER" | tr ' ' '|'))\$"
+            echo "Running filtered tests: $RUN_RE"
+            go test -v -run "$RUN_RE" ./... 2>&1 | tee test.log
+            for t in $TEST_FILTER; do
+              grep -q -- "^=== RUN   $t\$" test.log || { echo "Requested test $t did not run"; exit 1; }
+            done
+          else
+            go test -v ./... 2>&1 | tee test.log
+          fi
+          echo "===== Test summary (go ${{ matrix.go }}) ====="
+          echo "passed:  $(awk '/--- PASS/{n++} END{print n+0}' test.log)"
+          echo "failed:  $(awk '/--- FAIL/{n++} END{print n+0}' test.log)"
+          echo "skipped: $(awk '/--- SKIP/{n++} END{print n+0}' test.log)"
+          awk '/--- SKIP/{print}' test.log
+          echo "packages ok: $(awk '/^ok /{n++} END{print n+0}' test.log)"
