@@ -887,12 +887,37 @@ func TestNativeStructEmbedded(t *testing.T) {
 	var nativeTests = []struct {
 		expr string
 		in   any
+		out  any
 	}{
 		{
 			expr: `test.embedded.custom_name == "name"`,
 			in: map[string]any{
-				"test": &TestEmbeddedTypes{TestNestedType{NestedCustomName: "name"}},
+				"test": &TestEmbeddedTypes{
+					TestNestedType: TestNestedType{NestedCustomName: "name"},
+					Skipped:        "should-be-hidden",
+				},
 			},
+			out: true,
+		},
+		{
+			expr: `dyn(test.embedded)["-"] == "error"`,
+			in: map[string]any{
+				"test": &TestEmbeddedTypes{
+					TestNestedType: TestNestedType{NestedCustomName: "name"},
+					Skipped:        "should-be-hidden",
+				},
+			},
+			out: errors.New("no such field: -"),
+		},
+		{
+			expr: `test.embedded == ext.TestNestedType{custom_name: "name"}`,
+			in: map[string]any{
+				"test": &TestEmbeddedTypes{
+					TestNestedType: TestNestedType{NestedCustomName: "name"},
+					Skipped:        "should-be-hidden",
+				},
+			},
+			out: true,
 		},
 	}
 
@@ -931,14 +956,297 @@ func TestNativeStructEmbedded(t *testing.T) {
 				}
 				out, _, err := prg.Eval(tc.in)
 				if err != nil {
-					t.Fatal(err)
+					if !errors.Is(err, tc.out.(error)) {
+						t.Fatalf("got %v, wanted %v for expr: %s", err, tc.out, tc.expr)
+					}
+					continue
 				}
-				if !reflect.DeepEqual(out.Value(), true) {
-					t.Errorf("got %v, wanted true for expr: %s", out.Value(), tc.expr)
+				if !reflect.DeepEqual(out.Value(), tc.out) {
+					t.Errorf("got %v, wanted %v for expr: %s", out.Value(), tc.out, tc.expr)
 				}
 			}
 		})
 	}
+}
+
+func TestNativeStructHiddenField(t *testing.T) {
+	envOpts := []cel.EnvOption{
+		NativeTypes(
+			reflect.TypeOf(&TestEmbeddedTypes{}),
+			ParseStructTag("json"),
+		),
+		cel.Variable("test", cel.ObjectType("ext.TestEmbeddedTypes")),
+	}
+
+	env, err := cel.NewEnv(envOpts...)
+	if err != nil {
+		t.Fatalf("cel.NewEnv(NativeTypes()) failed: %v", err)
+	}
+
+	// 1. Static reference compilation failure case
+	// Attempting to compile `test.Password` should fail static analysis because the field is skipped/hidden.
+	_, iss := env.Compile("test.Password")
+	if iss.Err() == nil {
+		t.Error("env.Compile('test.Password') succeeded, expected a compilation/check error")
+	}
+
+	// 2. Dynamic reference runtime evaluation failure case
+	// Using dyn(test).Password should compile successfully (since dyn disables static type checks),
+	// but it must fail at runtime during evaluation because the field is not exposed.
+	ast, iss := env.Compile("dyn(test).Password")
+	if iss.Err() != nil {
+		t.Fatalf("env.Compile('dyn(test).Password') failed: %v", iss.Err())
+	}
+	prg, err := env.Program(ast)
+	if err != nil {
+		t.Fatalf("env.Program() failed: %v", err)
+	}
+	in := map[string]any{
+		"test": &TestEmbeddedTypes{
+			Skipped: "sensitive_password",
+		},
+	}
+	out, _, err := prg.Eval(in)
+	if err == nil {
+		t.Errorf("prg.Eval() succeeded and returned %v, expected runtime error accessing hidden field", out)
+	}
+}
+
+func TestNativeStructHiddenFieldNotExposed(t *testing.T) {
+	in := map[string]any{
+		"test": &TestEmbeddedTypes{
+			TestNestedType: TestNestedType{NestedCustomName: "name"},
+			Skipped:        "sensitive_password",
+		},
+	}
+	tests := []struct {
+		name       string
+		opt        NativeTypesOption
+		hiddenName string
+	}{
+		{
+			name:       "json-dash-tag",
+			opt:        ParseStructTag("json"),
+			hiddenName: "-",
+		},
+		{
+			name: "empty-field-name",
+			opt: ParseStructField(func(f reflect.StructField) string {
+				if f.Name == "Skipped" {
+					return ""
+				}
+				return fieldNameByTag("json")(f)
+			}),
+			hiddenName: "",
+		},
+	}
+	for _, tst := range tests {
+		tc := tst
+		t.Run(tc.name, func(t *testing.T) {
+			env, err := cel.NewEnv(
+				NativeTypes(reflect.TypeOf(&TestEmbeddedTypes{}), tc.opt),
+				cel.Variable("test", cel.ObjectType("ext.TestEmbeddedTypes")),
+			)
+			if err != nil {
+				t.Fatalf("cel.NewEnv(NativeTypes()) failed: %v", err)
+			}
+
+			// The hidden field must not be enumerated as a struct field.
+			fields, found := env.CELTypeProvider().FindStructFieldNames("ext.TestEmbeddedTypes")
+			if !found || !reflect.DeepEqual(fields, []string{"embedded"}) {
+				t.Errorf("FindStructFieldNames() got %v, wanted [embedded]", fields)
+			}
+
+			// Index access using the hidden field name must not return the field value.
+			expr := fmt.Sprintf("dyn(test)[%q]", tc.hiddenName)
+			pAst, iss := env.Parse(expr)
+			if iss.Err() != nil {
+				t.Fatalf("env.Parse(%v) failed: %v", expr, iss.Err())
+			}
+			cAst, iss := env.Check(pAst)
+			if iss.Err() != nil {
+				t.Fatalf("env.Check(%v) failed: %v", expr, iss.Err())
+			}
+			for _, ast := range []*cel.Ast{pAst, cAst} {
+				prg, err := env.Program(ast)
+				if err != nil {
+					t.Fatalf("env.Program(%v) failed: %v", expr, err)
+				}
+				out, _, err := prg.Eval(in)
+				if err == nil {
+					t.Errorf("prg.Eval(%v) got %v, wanted no such field error", expr, out)
+					continue
+				}
+				if !strings.Contains(err.Error(), "no such field") {
+					t.Errorf("prg.Eval(%v) got error %v, wanted no such field error", expr, err)
+				}
+			}
+
+			// JSON conversion of the native object must not serialize the hidden field.
+			ast, iss := env.Compile("test")
+			if iss.Err() != nil {
+				t.Fatalf("env.Compile(test) failed: %v", iss.Err())
+			}
+			prg, err := env.Program(ast)
+			if err != nil {
+				t.Fatalf("env.Program() failed: %v", err)
+			}
+			out, _, err := prg.Eval(in)
+			if err != nil {
+				t.Fatalf("prg.Eval(test) failed: %v", err)
+			}
+			jsonVal, err := out.ConvertToNative(reflect.TypeOf(&structpb.Struct{}))
+			if err != nil {
+				t.Fatalf("out.ConvertToNative(Struct) failed: %v", err)
+			}
+			jsonFields := jsonVal.(*structpb.Struct).GetFields()
+			if _, found := jsonFields[tc.hiddenName]; found {
+				t.Errorf("out.ConvertToNative(Struct) exposed hidden field %q: %v", tc.hiddenName, jsonVal)
+			}
+			if _, found := jsonFields["embedded"]; !found || len(jsonFields) != 1 {
+				t.Errorf("out.ConvertToNative(Struct) got %v, wanted only the embedded field", jsonVal)
+			}
+		})
+	}
+
+	t.Run("multiple-hidden-fields", func(t *testing.T) {
+		type hiddenFields struct {
+			Name   string `json:"name"`
+			Secret string `json:"-"`
+			Token  string `json:"-"`
+		}
+		env, err := cel.NewEnv(
+			NativeTypes(reflect.TypeOf(&hiddenFields{}), ParseStructTag("json")),
+			cel.Variable("x", cel.ObjectType("ext.hiddenFields")),
+		)
+		if err != nil {
+			t.Fatalf("cel.NewEnv(NativeTypes()) with multiple hidden fields failed: %v", err)
+		}
+		vars := map[string]any{
+			"x": &hiddenFields{Name: "visible", Secret: "secret", Token: "token"},
+		}
+		ast, iss := env.Compile(`x.name == "visible"`)
+		if iss.Err() != nil {
+			t.Fatalf("env.Compile() failed: %v", iss.Err())
+		}
+		prg, err := env.Program(ast)
+		if err != nil {
+			t.Fatalf("env.Program() failed: %v", err)
+		}
+		out, _, err := prg.Eval(vars)
+		if err != nil || out != types.True {
+			t.Errorf("prg.Eval() got %v, %v, wanted true", out, err)
+		}
+		ast, iss = env.Compile(`dyn(x)["-"]`)
+		if iss.Err() != nil {
+			t.Fatalf("env.Compile() failed: %v", iss.Err())
+		}
+		prg, err = env.Program(ast)
+		if err != nil {
+			t.Fatalf("env.Program() failed: %v", err)
+		}
+		out, _, err = prg.Eval(vars)
+		if err == nil {
+			t.Errorf("prg.Eval(dyn(x)[\"-\"]) got %v, wanted no such field error", out)
+		}
+	})
+
+	t.Run("escaped-identifier", func(t *testing.T) {
+		env, err := cel.NewEnv(
+			NativeTypes(reflect.TypeOf(&TestEmbeddedTypes{}), ParseStructTag("json")),
+			cel.Variable("test", cel.ObjectType("ext.TestEmbeddedTypes")),
+			cel.EnableIdentifierEscapeSyntax(),
+		)
+		if err != nil {
+			t.Fatalf("cel.NewEnv(NativeTypes()) failed: %v", err)
+		}
+		// Static selection, presence testing, and construction using the hidden field name must
+		// fail type-checking.
+		for _, expr := range []string{
+			"test.`-`",
+			"has(test.`-`)",
+			"ext.TestEmbeddedTypes{`-`: 'injected'}",
+		} {
+			if _, iss := env.Compile(expr); iss.Err() == nil {
+				t.Errorf("env.Compile(%v) succeeded, wanted undefined field error", expr)
+			}
+		}
+		// Dynamic selection and presence testing using the hidden field name must fail at runtime.
+		for _, expr := range []string{
+			"dyn(test).`-`",
+			"has(dyn(test).`-`)",
+		} {
+			ast, iss := env.Compile(expr)
+			if iss.Err() != nil {
+				t.Fatalf("env.Compile(%v) failed: %v", expr, iss.Err())
+			}
+			prg, err := env.Program(ast)
+			if err != nil {
+				t.Fatalf("env.Program(%v) failed: %v", expr, err)
+			}
+			out, _, err := prg.Eval(in)
+			if err == nil || !strings.Contains(err.Error(), "no such field") {
+				t.Errorf("prg.Eval(%v) got %v, %v, wanted no such field error", expr, out, err)
+			}
+		}
+	})
+
+	t.Run("nested-hidden-field", func(t *testing.T) {
+		type hiddenInner struct {
+			Name   string `json:"name"`
+			Secret string `json:"-"`
+		}
+		type hiddenOuter struct {
+			Inner hiddenInner `json:"inner"`
+		}
+		// Only the outer type is registered; the inner type is registered implicitly.
+		env, err := cel.NewEnv(
+			NativeTypes(reflect.TypeOf(&hiddenOuter{}), ParseStructTag("json")),
+			cel.Variable("x", cel.ObjectType("ext.hiddenOuter")),
+		)
+		if err != nil {
+			t.Fatalf("cel.NewEnv(NativeTypes()) failed: %v", err)
+		}
+		vars := map[string]any{
+			"x": &hiddenOuter{Inner: hiddenInner{Name: "visible", Secret: "secret"}},
+		}
+		fields, found := env.CELTypeProvider().FindStructFieldNames("ext.hiddenInner")
+		if !found || !reflect.DeepEqual(fields, []string{"name"}) {
+			t.Errorf("FindStructFieldNames(ext.hiddenInner) got %v, wanted [name]", fields)
+		}
+		ast, iss := env.Compile(`dyn(x.inner)["-"]`)
+		if iss.Err() != nil {
+			t.Fatalf("env.Compile() failed: %v", iss.Err())
+		}
+		prg, err := env.Program(ast)
+		if err != nil {
+			t.Fatalf("env.Program() failed: %v", err)
+		}
+		out, _, err := prg.Eval(vars)
+		if err == nil {
+			t.Errorf("prg.Eval(dyn(x.inner)[\"-\"]) got %v, wanted no such field error", out)
+		}
+		ast, iss = env.Compile(`x`)
+		if iss.Err() != nil {
+			t.Fatalf("env.Compile(x) failed: %v", iss.Err())
+		}
+		prg, err = env.Program(ast)
+		if err != nil {
+			t.Fatalf("env.Program() failed: %v", err)
+		}
+		out, _, err = prg.Eval(vars)
+		if err != nil {
+			t.Fatalf("prg.Eval(x) failed: %v", err)
+		}
+		jsonVal, err := out.ConvertToNative(reflect.TypeOf(&structpb.Struct{}))
+		if err != nil {
+			t.Fatalf("out.ConvertToNative(Struct) failed: %v", err)
+		}
+		inner := jsonVal.(*structpb.Struct).GetFields()["inner"].GetStructValue().GetFields()
+		if _, found := inner["-"]; found || len(inner) != 1 {
+			t.Errorf("out.ConvertToNative(Struct) got %v, wanted only the inner name field", jsonVal)
+		}
+	})
 }
 
 type TestNestedStruct struct {
@@ -1106,4 +1414,5 @@ type TestMapVal struct {
 
 type TestEmbeddedTypes struct {
 	TestNestedType `json:"embedded,omitempty"`
+	Skipped        string `json:"-"`
 }
